@@ -328,9 +328,7 @@ html,body{
     </div>
 
   </div>
-  </div><!-- /image-panel -->
-
-  <div class="text-panel" id="text-panel">
+  </div><div class="text-panel" id="text-panel">
     <div class="section" style="border:1.5px solid var(--border);border-radius:var(--r) var(--r) 0 0">
       <div class="section-title">치환 규칙</div>
       <div id="rules-list"></div>
@@ -621,6 +619,12 @@ function toggleAuto(){
 }
 
 let cuteMode=false;
+let debugMode=false;
+const APP_VER='v20';
+function toggleDebug(){
+  debugMode=!debugMode;
+  if(ocrData)applyCensor();
+}
 function toggleCute(){
   cuteMode=!cuteMode;
   document.getElementById('cute-check').classList.toggle('on',cuteMode);
@@ -711,10 +715,16 @@ function loadImage(input){
 }
 
 function getProcessedCanvas(srcImg){
+  // 글자가 작으면 확대 (OCR은 글자 높이 50~60px 부근에서 가장 정확)
+  let k=Math.min(2,Math.max(1,1900/srcImg.width));
+  // 너무 큰 이미지는 메모리 보호
+  if(srcImg.width*k>3000)k=Math.max(1,3000/srcImg.width);
   const c=document.createElement('canvas');
-  c.width=srcImg.width; c.height=srcImg.height;
+  c.width=Math.round(srcImg.width*k); c.height=Math.round(srcImg.height*k);
   const ctx=c.getContext('2d');
-  ctx.drawImage(srcImg,0,0);
+  ctx.imageSmoothingEnabled=true;
+  ctx.imageSmoothingQuality='high';
+  ctx.drawImage(srcImg,0,0,c.width,c.height);
   const id=ctx.getImageData(0,0,c.width,c.height);
   const d=id.data;
   for(let i=0;i<d.length;i+=4){
@@ -723,7 +733,39 @@ function getProcessedCanvas(srcImg){
     d[i]=d[i+1]=d[i+2]=v;
   }
   ctx.putImageData(id,0,0);
-  return c;
+  return {canvas:c,k};
+}
+
+// OCR 좌표를 원본 이미지 크기로 환산
+function unscaleOcr(data,k){
+  if(k===1)return;
+  const seen=new Set();
+  const fix=b=>{
+    if(!b||seen.has(b))return;seen.add(b);
+    b.x0/=k;b.x1/=k;b.y0/=k;b.y1/=k;
+  };
+  (data.words||[]).forEach(w=>{
+    fix(w.bbox);
+    (w.symbols||[]).forEach(s=>fix(s.bbox));
+  });
+  (data.symbols||[]).forEach(s=>fix(s.bbox));
+}
+
+// 워커 재사용 + 정확도 파라미터 (PSM 6: 단일 텍스트 블록 — 세로획 오인식 대폭 감소)
+// 언어별로 따로 캐시: 한글은 kor 전용이 정확, 영어 단어 검색 시에만 eng 추가 패스
+let tessWorkers={},onProg=null;
+async function getTessWorker(lang){
+  if(tessWorkers[lang])return tessWorkers[lang];
+  const w=await Tesseract.createWorker(lang,1,{
+    logger:m=>{if(onProg)onProg(m);}
+  });
+  await w.setParameters({
+    tessedit_pageseg_mode:'6',
+    preserve_interword_spaces:'1',
+    user_defined_dpi:'300'
+  });
+  tessWorkers[lang]=w;
+  return w;
 }
 
 async function doScan(){
@@ -739,17 +781,30 @@ async function doScan(){
   document.getElementById('progress').classList.add('show');
   fill.style.width='0%'; ptxt.textContent='0%';
   try{
-    const processed=getProcessedCanvas(origImg);
-    const result=await Tesseract.recognize(processed,'kor+eng',{
-      logger:m=>{
-        if(m.progress!==undefined){
-          const p=Math.round(m.progress*100);
-          fill.style.width=p+'%';
-          ptxt.textContent=m.status==='recognizing text'?p+'%':'';
-        }
+    const {canvas:processed,k}=getProcessedCanvas(origImg);
+    onProg=m=>{
+      if(m.progress!==undefined){
+        const p=Math.round(m.progress*100);
+        fill.style.width=p+'%';
+        ptxt.textContent=m.status==='recognizing text'?p+'%':'';
       }
-    });
+    };
+    // 한국어 패스 (기본)
+    const korWorker=await getTessWorker('kor');
+    const result=await korWorker.recognize(processed);
+    unscaleOcr(result.data,k);
     ocrData=result.data;
+    // 입력 단어에 영어가 있으면 영어 패스 추가 후 병합
+    if(/[a-z]/i.test(w1+w2)){
+      ptxt.textContent='영어 단어 스캔 중...';
+      const engWorker=await getTessWorker('eng');
+      const engRes=await engWorker.recognize(processed);
+      unscaleOcr(engRes.data,k);
+      ocrData={
+        words:[...(result.data.words||[]),...(engRes.data.words||[])],
+        symbols:[...(result.data.symbols||[]),...(engRes.data.symbols||[])]
+      };
+    }
     fill.style.width='100%'; ptxt.textContent='100%';
     const canvas=document.getElementById('canvas');
     const off=document.createElement('canvas');
@@ -797,8 +852,14 @@ function applyCensor(){
 
   // 모든 단어 높이의 중앙값 → 일정한 박스 높이 기준
   const allWords=ocrData.words||[];
-  const heights=allWords.map(w=>w.bbox.y1-w.bbox.y0).filter(h=>h>0).sort((a,b)=>a-b);
-  const medH=heights.length?heights[Math.floor(heights.length/2)]:20;
+  // 글자높이 기준(medH): 한글이 포함된 단어만 사용 — 영어 패스/유령 박스 오염 차단
+  let hPool=allWords.filter(w=>/[\uac00-\ud7a3]/.test(w.text||''))
+    .map(w=>w.bbox.y1-w.bbox.y0).filter(h=>h>0).sort((a,b)=>a-b);
+  if(!hPool.length)hPool=allWords.map(w=>w.bbox.y1-w.bbox.y0).filter(h=>h>0).sort((a,b)=>a-b);
+  let medH=hPool.length?hPool[Math.floor(hPool.length/2)]:20;
+  // 2단계: 중앙값 주변(0.6~1.5배)만 남기고 다시 중앙값 → 세로 유령 박스 영향 제거
+  const trimmed=hPool.filter(h=>h>medH*0.6&&h<medH*1.5).sort((a,b)=>a-b);
+  if(trimmed.length)medH=trimmed[Math.floor(trimmed.length/2)];
   const padY=Math.round(medH*0.1);
   const fixedH=medH+padY*2;
 
@@ -809,13 +870,12 @@ function applyCensor(){
     if(w.symbols&&w.symbols.length){
       w.symbols.forEach(s=>{
         const t=(s.text||'').toLowerCase();
-        for(const ch of t){
-          if(/[\p{L}\p{N}]/u.test(ch)) chars.push({ch,sym:s});
-        }
+        const cs=[...t].filter(ch=>/[\p{L}\p{N}]/u.test(ch));
+        cs.forEach((ch,ci)=>chars.push({ch,sym:s,ci,cn:cs.length}));
       });
     }else{
       const t=(w.text||'').toLowerCase().replace(/[^\p{L}\p{N}]/gu,'');
-      for(const ch of t) chars.push({ch,sym:null});
+      for(const ch of t) chars.push({ch,sym:null,ci:0,cn:1});
     }
     const txt=chars.map(c=>c.ch).join('');
     if(!txt)return;
@@ -824,20 +884,65 @@ function applyCensor(){
       const sw=en.sw;
       let idx=txt.indexOf(sw);
       while(idx>=0){
-        const s0=chars[idx].sym, s1=chars[idx+sw.length-1].sym;
+        const a=chars[idx], b=chars[idx+sw.length-1];
         let x0,x1;
-        if(s0&&s0.bbox&&s1&&s1.bbox&&s1.bbox.x1>s0.bbox.x0){
-          // 심볼 bbox가 있으면 정확히 해당 글자 구간만
-          x0=s0.bbox.x0; x1=s1.bbox.x1;
+        // 단어가 순수 한글이면: 단어 폭 ÷ 글자 수 = 정확한 글자 간격 → 등분 계산
+        // (한글은 글자 폭이 균일해서 가장 정확. 심볼 좌표의 오차를 우회)
+        const raw=(w.text||'').trim();
+        const pureHangul=raw.length>0&&raw.length===txt.length&&/^[\uac00-\ud7a3]+$/.test(raw);
+        if(pureHangul&&/^[\uac00-\ud7a3]+$/.test(sw)){
+          const unit=(bb.x1-bb.x0)/txt.length;
+          x0=bb.x0+unit*idx;
+          x1=bb.x0+unit*(idx+sw.length);
         }else{
-          // 없으면 글자 수 비율로 위치 추정
+        if(a.sym&&a.sym.bbox&&b.sym&&b.sym.bbox){
+          // 심볼이 여러 글자를 담고 있으면 그 안에서 비율로 잘라냄 ("루의" 덩어리 → 루 부분만)
+          const aw=a.sym.bbox.x1-a.sym.bbox.x0, bw2=b.sym.bbox.x1-b.sym.bbox.x0;
+          x0=a.sym.bbox.x0+aw*(a.ci/a.cn);
+          x1=b.sym.bbox.x0+bw2*((b.ci+1)/b.cn);
+        }
+        if(!(x1>x0)){
+          // 심볼 정보가 없거나 이상하면 글자 수 비율로 추정
           const ww=bb.x1-bb.x0;
           x0=bb.x0+Math.round(ww*idx/txt.length);
           x1=bb.x0+Math.round(ww*(idx+sw.length)/txt.length);
         }
+        } // end else (비순수 단어 경로)
+        let dbgInfo='';
+        // 한글 단어: 끝점은 OCR을 믿지 않고 픽셀에서 잰 간격으로 '계산'
+        // x1 = x0 + 글자수 × 간격. OCR이 단어를 쪼개거나 ㅏㅣ를 빼먹어도 무관.
+        if(/^[\uac00-\ud7a3]+$/.test(sw)){
+          const cyy=Math.round((bb.y0+bb.y1)/2);
+          const gh=Math.max(8,bb.y1-bb.y0);
+          let estUnit=(x1-x0)/sw.length;
+          if(!(estUnit>2)||estUnit>medH*1.4)estUnit=Math.min((bb.x1-bb.x0)/txt.length,medH);
+          estUnit=Math.max(estUnit,medH*0.55);
+          const A=measureAdvance3(x0,cyy,medH); // 픽셀 자기상관 간격 (3지점 중앙값)
+          // A · OCR추정 · 글자높이×0.97 셋의 중앙값 — 하나가 틀려도 안전
+          const ref=medH*0.97;
+          let unitF;
+          if(A){
+            const arr=[A,estUnit,ref].sort((p,q)=>p-q);unitF=arr[1];
+          }else{
+            unitF=Math.abs(estUnit-ref)<=medH*0.2?estUnit:ref;
+          }
+          const ideal=sw.length*unitF;
+          const actualW = x1 - x0;
+          const realIdeal = actualW > ideal ? actualW : ideal;
+          x1 = x0 + realIdeal;
+          [x0,x1]=refineXEdges(x0,x1,cyy,gh,unitF,realIdeal);
+          dbgInfo='W A:'+(A||'x')+' u:'+Math.round(unitF)+' e:'+Math.round(estUnit)+' gh:'+gh;
+        }
         const cy=Math.round((bb.y0+bb.y1)/2);
         const lbl=en.auto?(cuteMode?'~'+(CUTE_MAP[sw]||sw)+'~':autoLabel(sw)):null;
         drawCensor(ctx,canvas,x0,cy-Math.round(fixedH/2),x1-x0,fixedH,lbl);
+        if(debugMode&&dbgInfo){
+          ctx.save();
+          ctx.font=Math.max(9,Math.round(medH*0.38))+'px monospace';
+          ctx.fillStyle='#0a7d2c';
+          ctx.fillText(dbgInfo,x0,cy+fixedH*0.95);
+          ctx.restore();
+        }
         drawnRects.push({x0,x1,y0:cy-fixedH/2,y1:cy+fixedH/2});
         counts[si]++;
         idx=txt.indexOf(sw,idx+1);
@@ -852,30 +957,88 @@ function applyCensor(){
     const map=[]; let allText='';
     syms.forEach(s=>{
       const t=(s.text||'').toLowerCase();
-      for(const ch of t){
-        if(/[\p{L}\p{N}]/u.test(ch)){allText+=ch;map.push(s);}
-      }
+      const cs=[...t].filter(ch=>/[\p{L}\p{N}]/u.test(ch));
+      cs.forEach((ch,ci)=>{allText+=ch;map.push({sym:s,ci,cn:cs.length});});
     });
     searchWords.forEach((en,si)=>{
       const sw=en.sw;
       let idx=allText.indexOf(sw);
       while(idx>=0){
-        const start=map[idx];
-        const end=map[Math.min(idx+sw.length-1,map.length-1)];
-        if(start?.bbox&&end?.bbox&&end.bbox.x1>start.bbox.x0){
-          const cy=Math.round((start.bbox.y0+start.bbox.y1)/2);
-          const cy2=Math.round((end.bbox.y0+end.bbox.y1)/2);
+        const a=map[idx];
+        const b=map[Math.min(idx+sw.length-1,map.length-1)];
+        if(a?.sym?.bbox&&b?.sym?.bbox){
+          const aw=a.sym.bbox.x1-a.sym.bbox.x0, bw2=b.sym.bbox.x1-b.sym.bbox.x0;
+          let x0=a.sym.bbox.x0+aw*(a.ci/a.cn);
+          let x1=b.sym.bbox.x0+bw2*((b.ci+1)/b.cn);
+          const cy=Math.round((a.sym.bbox.y0+a.sym.bbox.y1)/2);
+          const cy2=Math.round((b.sym.bbox.y0+b.sym.bbox.y1)/2);
+          // 한글: 끝점은 픽셀에서 잰 간격으로 계산 (OCR 좌표 오류 무관)
+          let dbgF='';
+          if(/^[\uac00-\ud7a3]+$/.test(sw)){
+            let estUnit=(x1-x0)/sw.length;
+            if(!(estUnit>2)||estUnit>medH*1.4)estUnit=medH;
+            estUnit=Math.max(estUnit,medH*0.55);
+            const A=measureAdvance3(x0,cy,medH);
+            const ref=medH*0.97;
+            let unitF;
+            if(A){
+              const arr=[A,estUnit,ref].sort((p,q)=>p-q);unitF=arr[1];
+            }else{
+              unitF=Math.abs(estUnit-ref)<=medH*0.2?estUnit:ref;
+            }
+            const ideal=sw.length*unitF;
+            const actualW = x1 - x0;
+            const realIdeal = actualW > ideal ? actualW : ideal;
+            x1 = x0 + realIdeal;
+            const r2=refineXEdges(x0,x1,cy,fixedH,unitF,realIdeal);
+            x0=r2[0];x1=r2[1];
+            dbgF='F A:'+(A||'x')+' u:'+Math.round(unitF)+' e:'+Math.round(estUnit);
+          }
           // 줄이 바뀌는 매칭은 무시, 이미 가린 자리도 무시
-          if(Math.abs(cy-cy2)<fixedH*0.8&&!isCovered(start.bbox.x0,end.bbox.x1,cy)){
+          if(x1>x0&&Math.abs(cy-cy2)<fixedH*0.8&&!isCovered(x0,x1,cy)){
             const lbl=en.auto?(cuteMode?'~'+(CUTE_MAP[sw]||sw)+'~':autoLabel(sw)):null;
-            drawCensor(ctx,canvas,start.bbox.x0,cy-Math.round(fixedH/2),end.bbox.x1-start.bbox.x0,fixedH,lbl);
-            drawnRects.push({x0:start.bbox.x0,x1:end.bbox.x1,y0:cy-fixedH/2,y1:cy+fixedH/2});
+            drawCensor(ctx,canvas,x0,cy-Math.round(fixedH/2),x1-x0,fixedH,lbl);
+            if(debugMode&&dbgF){
+              ctx.save();
+              ctx.font=Math.max(9,Math.round(medH*0.38))+'px monospace';
+              ctx.fillStyle='#0a7d2c';
+              ctx.fillText(dbgF,x0,cy+fixedH*0.95);
+              ctx.restore();
+            }
+            drawnRects.push({x0,x1,y0:cy-fixedH/2,y1:cy+fixedH/2});
             counts[si]++;
+          }else if(debugMode){
+            // 스킵된 매칭 표시 (줄바뀜 cy차이 / 중복)
+            ctx.save();
+            ctx.font=Math.max(9,Math.round(medH*0.38))+'px monospace';
+            ctx.fillStyle='#d97706';
+            const why=Math.abs(cy-cy2)>=fixedH*0.8?'skip:line(cy'+Math.abs(cy-cy2)+')':'skip:dup';
+            ctx.fillText(why,x0,cy+fixedH*0.95);
+            ctx.restore();
           }
         }
         idx=allText.indexOf(sw,idx+1);
       }
     });
+  }
+
+  // 진단 모드: OCR이 인식한 단어 영역과 읽은 텍스트를 표시
+  if(debugMode){
+    ctx.save();
+    ctx.lineWidth=Math.max(1,Math.round(medH*0.06));
+    allWords.forEach(w=>{
+      const b=w.bbox;
+      ctx.strokeStyle='rgba(30,100,255,0.85)';
+      ctx.strokeRect(b.x0,b.y0,b.x1-b.x0,b.y1-b.y0);
+      const t=(w.text||'').trim();
+      if(t){
+        const fs=Math.max(9,Math.round(medH*0.42));
+        ctx.font=fs+'px sans-serif';
+        ctx.fillStyle='rgba(220,30,30,0.95)';
+        ctx.fillText(t,b.x0,Math.max(fs,b.y0-2));
+      }
+    });
+    ctx.restore();
   }
 
   const count=counts.reduce((a,b)=>a+b,0);
@@ -886,6 +1049,7 @@ function applyCensor(){
   if(missed.length){
     msg+='<br/>"'+missed.join('", "')+'" 못 찾았어요 — 글씨 인식이 안 된 걸 수 있어요. 그리기로 직접 가려보세요';
   }
+  msg+=' <span onclick="toggleDebug()" style="text-decoration:underline;cursor:pointer;opacity:.6">🔍</span><span style="opacity:.35;font-size:10px"> '+APP_VER+'</span>';
   found.innerHTML=msg;
   found.classList.add('show');
   document.getElementById('dl-btn').style.display=count?'':'none';
@@ -1003,8 +1167,120 @@ function labelSprite(text){
   return sp;
 }
 
+// 잉크 패턴의 반복 주기(자기상관)로 글자 간격을 픽셀에서 직접 측정
+// OCR 좌표가 엉망이어도 영향받지 않는 진짜 간격
+function measureAdvance(x0,cy,h){
+  if(!offCtx)return null;
+  const cw=offCtx.canvas.width,ch=offCtx.canvas.height;
+  const sx=Math.max(0,Math.floor(x0-h*0.3));
+  const ex=Math.min(cw-1,Math.ceil(x0+h*7));
+  const sy=Math.max(0,Math.floor(cy-h*0.45)),ey=Math.min(ch-1,Math.ceil(cy+h*0.45));
+  const w=ex-sx+1,hh=ey-sy+1;
+  if(w<h*2.2||hh<4)return null;
+  let img;
+  try{img=offCtx.getImageData(sx,sy,w,hh).data;}catch(e){return null;}
+  const lum=p=>0.299*img[p]+0.587*img[p+1]+0.114*img[p+2];
+  const ls=[];
+  for(let i=0;i<img.length;i+=20)ls.push(lum(i-(i%4)));
+  ls.sort((a,b)=>a-b);
+  const bg=ls[ls.length>>1];
+  const prof=new Float32Array(w);
+  for(let yy=0;yy<hh;yy++){
+    for(let xx=0;xx<w;xx++){
+      if(Math.abs(lum((yy*w+xx)*4)-bg)>50)prof[xx]++;
+    }
+  }
+  let mean=0;for(let i=0;i<w;i++)mean+=prof[i];mean/=w;
+  for(let i=0;i<w;i++)prof[i]-=mean;
+  // 한글 간격은 글자높이의 0.72~1.18배 — 그 밖(띄어쓰기 왜곡·하위 주기)은 제외
+  const lo=Math.max(4,Math.floor(h*0.72)),hi=Math.min(w-2,Math.ceil(h*1.18));
+  if(hi<=lo)return null;
+  const V=new Float32Array(hi+1);
+  let vmax=-Infinity;
+  for(let lag=lo;lag<=hi;lag++){
+    let s=0,n=0;
+    for(let i=0;i+lag<w;i++){s+=prof[i]*prof[i+lag];n++;}
+    V[lag]=n>0?s/n:-Infinity;
+    if(V[lag]>vmax)vmax=V[lag];
+  }
+  if(!(vmax>0))return null;
+  // 가장 강한 피크가 아니라 '충분히 강한(85%+) 피크 중 가장 작은 것' = 기본 주기
+  for(let lag=lo;lag<=hi;lag++){
+    if(V[lag]>=vmax*0.85
+       &&(lag===lo||V[lag]>=V[lag-1])
+       &&(lag===hi||V[lag]>=V[lag+1])){
+      return lag;
+    }
+  }
+  return null;
+}
+
+// 세 위치에서 재서 중앙값 — 한 곳이 빗나가도 안전
+function measureAdvance3(x0,cy,h){
+  const vals=[];
+  [0,Math.round(h*2),Math.round(h*4)].forEach(off=>{
+    const r=measureAdvance(x0+off,cy,h);
+    if(r)vals.push(r);
+  });
+  if(!vals.length)return null;
+  vals.sort((a,b)=>a-b);
+  return vals[vals.length>>1];
+}
+
+// 실제 픽셀을 보고 글자 사이 빈틈에 박스 양끝을 스냅 → 폰트 무관 정확한 경계
+// ideal = 글자수×글자폭. 끝 경계는 "박스 폭이 ideal에 가장 가까워지는 틈"을 골라
+// 글자 내부 틈(ㅣ 앞 빈공간 등)에 잘못 붙는 걸 방지
+function refineXEdges(x0,x1,cy,h,unit,ideal){
+  if(!offCtx)return[x0,x1];
+  const cw=offCtx.canvas.width,ch=offCtx.canvas.height;
+  const pad=unit*0.6;
+  const sx=Math.max(0,Math.floor(x0-pad)),ex=Math.min(cw-1,Math.ceil(x1+pad));
+  const sy=Math.max(0,Math.floor(cy-h*0.45)),ey=Math.min(ch-1,Math.ceil(cy+h*0.45));
+  const w=ex-sx+1,hh=ey-sy+1;
+  if(w<6||hh<4)return[x0,x1];
+  let img;
+  try{img=offCtx.getImageData(sx,sy,w,hh).data;}catch(e){return[x0,x1];}
+  const lum=p=>0.299*img[p]+0.587*img[p+1]+0.114*img[p+2];
+  const ls=[];
+  for(let i=0;i<img.length;i+=20)ls.push(lum(i-(i%4)));
+  ls.sort((a,b)=>a-b);
+  const bg=ls[Math.floor(ls.length/2)];
+  const ink=new Array(w).fill(0);
+  for(let yy=0;yy<hh;yy++){
+    for(let xx=0;xx<w;xx++){
+      if(Math.abs(lum((yy*w+xx)*4)-bg)>50)ink[xx]++;
+    }
+  }
+  const gapThr=Math.max(1,Math.round(hh*0.03));
+  // 빈틈(run)들의 시작/끝/중앙 좌표 수집
+  const gaps=[];let runS=null;
+  for(let xx=0;xx<w;xx++){
+    if(ink[xx]<=gapThr){if(runS===null)runS=xx;}
+    else if(runS!==null){gaps.push({s:runS+sx,e:xx-1+sx,c:(runS+xx-1)/2+sx});runS=null;}
+  }
+  if(runS!==null)gaps.push({s:runS+sx,e:w-1+sx,c:(runS+w-1)/2+sx});
+  if(!gaps.length)return[x0,x0+ideal];
+  // 시작 경계: 틈의 '오른쪽 끝'(=글자 잉크 시작 직전)으로
+  // 띄어쓰기가 넓어도 박스가 왼쪽으로 밀리지 않음
+  let nx0=x0,d0=unit*0.45;
+  gaps.forEach(g=>{
+    const d=Math.abs(g.e-x0);
+    if(d<d0){d0=d;nx0=g.e;}
+  });
+  // 끝 경계: 시작 + 글자수×간격 = 다음 글자 잉크 시작 지점.
+  // 그 직전 틈의 중앙으로 살짝 안쪽 스냅 (다음 글자 안 건드림)
+  const target=nx0+ideal+unit*0.05;
+  let nx1=target, dBest=unit*0.4;
+  gaps.forEach(g=>{
+    const d=Math.abs(g.e-target);
+    if(d<dBest){dBest=d;nx1=Math.max(g.c,g.e-2);}
+  });
+  if(nx1-nx0>unit*0.6)return[nx0,nx1];
+  return[x0,x1];
+}
+
 function drawCensor(ctx,canvas,x,y,bw,bh,label){
-  const pxL=Math.max(4,Math.round(bh*0.15)),pxR=Math.max(1,Math.round(bh*0.03));
+  const pxL=Math.max(2,Math.round(bh*0.06)),pxR=Math.max(2,Math.round(bh*0.12));
   const rx=Math.max(0,x-pxL);
   const ry=Math.max(0,y);
   const rw=Math.min(bw+pxL+pxR,canvas.width-rx);
