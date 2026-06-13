@@ -349,7 +349,6 @@ html,body{
 </div>
 <div class="crop-modal" id="result-modal">
   <div class="crop-box">
-    <div class="crop-title">결과</div>
     <div class="result-text" id="result-text" style="flex:1;min-height:0;width:100%;padding:12px;border:1.5px solid var(--border);border-radius:8px;font-family:inherit;font-size:15px;line-height:1.7;overflow-y:auto;-webkit-overflow-scrolling:touch;background:#fafaf9;color:var(--text);white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere"></div>
     <div class="bg-picker">
       <span class="bg-label">배경</span>
@@ -470,11 +469,12 @@ function isDarkBg(hex){
 function renderMarkup(text,dark){
   const esc=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
   const grayCol = dark?'#b8b2aa':'#6b6560';
-  const codeBg  = '#1c1917';
+  const codeBg  = dark?'#3a3630':'#1c1917';
   const codeFg  = '#f0ece6';
+  const codeHdr = dark?'#2e2a26':'#2a2520';
   // 코드 토큰을 먼저 빼내 자리표시자로 보호 (코드 안의 ** 는 굵게 처리 안 함)
   const codes=[];
-  let t=text.replace(/```([\s\S]*?)```/g,(m,c)=>{codes.push({block:true,c});return '\u0000C'+(codes.length-1)+'\u0000';})
+  let t=text.replace(/\n?```([\s\S]*?)```\n?/g,(m,c)=>{codes.push({block:true,c});return '\u0000C'+(codes.length-1)+'\u0000';})
             .replace(/`([^`\n]+?)`/g,(m,c)=>{codes.push({block:false,c});return '\u0000C'+(codes.length-1)+'\u0000';});
   t=esc(t);
   t=t.replace(/\*\*([^*]+?)\*\*/g,'<b>$1</b>'); // **굵게**
@@ -483,17 +483,17 @@ function renderMarkup(text,dark){
   // 코드 자리표시자 복원
   t=t.replace(/\u0000C(\d+)\u0000/g,(m,i)=>{
     const it=codes[+i];
-    const inner=esc(it.c);
+    const inner=esc(it.block?it.c.trim():it.c);
     if(it.block){
-      return '<div style="position:relative;background:#1c1917;border-radius:10px;margin:6px 0;overflow:hidden">'
-        +'<div style="display:flex;align-items:center;justify-content:space-between;padding:7px 12px 6px;border-bottom:1px solid #2e2a27">'
+      return '<div style="position:relative;background:'+codeBg+';border-radius:10px;margin:6px 0;overflow:hidden">'
+        +'<div style="display:flex;align-items:center;justify-content:space-between;padding:7px 12px 6px;border-bottom:1px solid '+codeHdr+'">'
         +'<span style="font-size:10px;font-weight:600;letter-spacing:1px;color:#7a736d;text-transform:uppercase;font-family:inherit">INFO</span>'
         +'<button onclick="(function(){var txt=this.closest(\'div\').querySelector(\'code\').innerText;navigator.clipboard.writeText(txt).catch(()=>{});var el=this;el.textContent=\'✓\';setTimeout(()=>el.textContent=\'⧉\',1200);}).call(this)" style="background:none;border:none;cursor:pointer;color:#7a736d;font-size:14px;padding:0 2px;line-height:1" title="복사">⧉</button>'
         +'</div>'
-        +'<code style="display:block;color:#f0ece6;padding:12px 14px;font-family:inherit;font-size:14px;line-height:1.75;white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere">'+inner+'</code>'
+        +'<code style="display:block;color:#f0ece6;padding:10px 14px;font-family:inherit;font-size:14px;line-height:1.75;white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere">'+inner+'</code>'
         +'</div>';
     }
-    return '<code style="background:#1c1917;color:#f0ece6;border-radius:4px;padding:1px 5px;font-family:inherit;font-size:13px">'+inner+'</code>';
+    return '<code style="background:'+codeBg+';color:#f0ece6;border-radius:4px;padding:1px 5px;font-family:inherit;font-size:13px">'+inner+'</code>';
   });
   return t;
 }
@@ -529,9 +529,8 @@ renderRules();
 
 // ===== BG COLOR =====
 const BG_COLORS=[
-  {name:'검정',color:'#1c1917'},
-  {name:'진회색',color:'#2a2723'},
   {name:'흰색',color:'#ffffff'},
+  {name:'검정',color:'#1c1917'},
   {name:'베이지',color:'#faf6f0'},
   {name:'크림',color:'#fff9e6'},
   {name:'연핑크',color:'#fff0f3'},
@@ -539,6 +538,8 @@ const BG_COLORS=[
   {name:'민트',color:'#edfaf5'},
   {name:'피치',color:'#fff3ee'},
   {name:'스카이',color:'#eef5ff'},
+  {name:'연주황',color:'#efaf96'},
+  {name:'세이지',color:'#e8f5e8'},
 ];
 let selectedBg=BG_COLORS[0].color;
 const bgOpts=document.getElementById('bg-opts');
